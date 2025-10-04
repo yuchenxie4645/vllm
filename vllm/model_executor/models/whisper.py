@@ -15,8 +15,10 @@ from transformers.models.whisper.modeling_whisper import sinusoids
 
 from vllm.attention import Attention, AttentionType
 from vllm.attention.layer import MultiHeadAttention
+from vllm.attention.layers.cross_attention import CrossAttention
 from vllm.config import (CacheConfig, ModelConfig, SpeechToTextConfig,
                          VllmConfig)
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
@@ -25,12 +27,10 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, NestedTensors
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargsItems)
@@ -43,9 +43,9 @@ from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (MultiModalEmbeddings, SupportsMultiModal,
-                         SupportsTranscription, SupportsV0Only)
+                         SupportsTranscription)
 from .utils import (AutoWeightsLoader, WeightsMapper, cast_overflow_tensors,
-                    make_layers)
+                    make_layers, maybe_prefix)
 
 logger = init_logger(__name__)
 
@@ -124,6 +124,34 @@ class WhisperAudioInputs(TensorSchema):
                               TensorShape("b", "nmb", "t")]
 
 
+class WhisperEncoderAttention(MultiHeadAttention):
+    """Multi-headed attention for Whisper encoder with 2D tensor support."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Input shape: batch_size x seq_len x hidden_size
+                     or seq_len x hidden_size
+        """
+        is_2d = query.dim() == 2
+        if is_2d:
+            query = query.unsqueeze(0)
+            key = key.unsqueeze(0)
+            value = value.unsqueeze(0)
+
+        # Call the parent forward method
+        out = super().forward(query, key, value)
+
+        if is_2d:
+            out = out.squeeze(0)
+
+        return out
+
+
 class WhisperPositionalEmbedding(nn.Embedding):
 
     def __init__(self, num_positions: int, embedding_dim: int):
@@ -144,7 +172,6 @@ class WhisperAttention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        standalone_encoder: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -180,14 +207,25 @@ class WhisperAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        if standalone_encoder:
-            self.attn = MultiHeadAttention(
+        if attn_type == AttentionType.ENCODER:
+            self.attn = WhisperEncoderAttention(
                 self.num_heads,
                 self.head_dim,
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
             )
-        else:
+        elif self.attn_type == AttentionType.ENCODER_DECODER:
+            self.attn = CrossAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                attn_type=self.attn_type,
+            )
+        else:  # AttentionType.DECODER (regular decoder self-attention)
             self.attn = Attention(
                 self.num_heads,
                 self.head_dim,
@@ -332,11 +370,7 @@ class WhisperMLP(nn.Module):
 
 class WhisperEncoderLayer(nn.Module):
 
-    def __init__(self,
-                 *,
-                 vllm_config: VllmConfig,
-                 prefix: str = "",
-                 is_standalone_encoder: bool = False):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
@@ -350,7 +384,6 @@ class WhisperEncoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
-            standalone_encoder=is_standalone_encoder,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.mlp = WhisperMLP(
@@ -446,12 +479,10 @@ class WhisperEncoder(nn.Module):
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 is_standalone_encoder: bool = False,
                  init_in_fp32: bool = False):
         super().__init__()
         config = vllm_config.model_config.hf_config
         embed_dim = config.d_model
-        self.is_standalone_encoder = is_standalone_encoder
         self.num_mel_bins = config.num_mel_bins
         self.max_source_positions = config.max_source_positions
         self.embed_scale = (math.sqrt(embed_dim)
@@ -469,9 +500,7 @@ class WhisperEncoder(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.encoder_layers,
             lambda prefix: WhisperEncoderLayer(vllm_config=vllm_config,
-                                               prefix=f"{prefix}.layers",
-                                               is_standalone_encoder=
-                                               is_standalone_encoder),
+                                               prefix=f"{prefix}.layers"),
             prefix=f"{prefix}.layers",
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
@@ -550,10 +579,7 @@ class WhisperDecoder(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
 
@@ -666,6 +692,7 @@ class WhisperDummyInputsBuilder(BaseDummyInputsBuilder[WhisperProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: Optional[Mapping[str, BaseDummyOptions]] = None,
     ) -> MultiModalDataDict:
         feature_extractor = self.info.get_feature_extractor()
 
@@ -673,9 +700,13 @@ class WhisperDummyInputsBuilder(BaseDummyInputsBuilder[WhisperProcessingInfo]):
         audio_len = feature_extractor.chunk_length * sampling_rate
         num_audios = mm_counts.get("audio", 0)
 
+        audio_overrides = mm_options.get("audio") if mm_options else None
+
         return {
             "audio":
-            self._get_dummy_audios(length=audio_len, num_audios=num_audios)
+            self._get_dummy_audios(length=audio_len,
+                                   num_audios=num_audios,
+                                   overrides=audio_overrides)
         }
 
 
@@ -752,7 +783,7 @@ class WhisperMultiModalProcessor(
                                         info=WhisperProcessingInfo,
                                         dummy_inputs=WhisperDummyInputsBuilder)
 class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
-                                      SupportsMultiModal, SupportsV0Only):
+                                      SupportsMultiModal):
     packed_modules_mapping = {
         "self_attn.qkv_proj": [
             "self_attn.q_proj",
@@ -854,7 +885,8 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
         self.unpadded_vocab_size = config.vocab_size
         self.proj_out = ParallelLMHead(config.vocab_size,
                                        config.d_model,
-                                       quant_config=quant_config)
+                                       quant_config=quant_config,
+                                       prefix=maybe_prefix(prefix, "proj_out"))
         self.proj_out = self.proj_out.tie_weights(
             self.model.decoder.embed_tokens)
         logit_scale = getattr(config, "logit_scale", 1.0)
@@ -880,19 +912,20 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:
-        # TODO: This method does not obey the interface for SupportsMultiModal.
-        # Refactor this once encoder/decoder support is implemented in V1.
+        # Required as part of SupportsMultiModal interface.
         audio_input = self._parse_and_validate_audio_input(**kwargs)
-        return self.model.get_encoder_outputs(audio_input["input_features"])
+        return [self.model.get_encoder_outputs(audio_input["input_features"])]
 
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[NestedTensors] = None,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        *,
+        is_multimodal: Optional[torch.Tensor] = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        # TODO: This method just returns the decoder sequence embeddings since
-        # Whisper does not have encoder text tokens. Refactor this once
-        # encoder/decoder support is implemented in V1.
+        # This method just returns the decoder sequence embeddings since
+        # Whisper does not have encoder text tokens.
         return self.model.decoder.get_input_embeddings(input_ids)
 
     def _parse_and_validate_audio_input(
@@ -908,10 +941,8 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
 
         return WhisperAudioInputs(input_features=input_features)
 
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.proj_out, hidden_states,
-                                       sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.logits_processor(self.proj_out, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,

@@ -187,6 +187,16 @@ def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) \
         supports_router_weight and supports_activation
 
 
+def marlin_moe_intermediate_size(w1_packed: torch.Tensor,
+                                 w2_packed: torch.Tensor):
+    """
+    Given Marlin packed weight matrices w1_packed, and w2_packed,
+    return the MoE intermediate size N 
+    """
+    marlin_tile_size = 16
+    return w2_packed.size(1) * marlin_tile_size
+
+
 def marlin_make_workspace(output_size_per_partition: int,
                           device: torch.device) -> torch.Tensor:
     max_workspace_size = (output_size_per_partition //
@@ -201,7 +211,7 @@ def marlin_make_workspace(output_size_per_partition: int,
 def marlin_make_workspace_new(device: torch.device,
                               max_blocks_per_sm: int = 1) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
-    # size. The num of threadblocks is is sms_count * max_blocks_per_sm.
+    # size. The num of threadblocks is sms_count * max_blocks_per_sm.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(sms * max_blocks_per_sm,
                        dtype=torch.int,

@@ -28,6 +28,8 @@ from terratorch.vllm import (DummyDataGenerator, InferenceRunner,
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
+from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -36,7 +38,7 @@ from vllm.multimodal.cache import MultiModalProcessorOnlyCache
 from vllm.multimodal.inputs import (ImageItem, ModalityData,
                                     MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalInputs, MultiModalKwargsItems,
-                                    PlaceholderRange)
+                                    MultiModalUUIDDict, PlaceholderRange)
 from vllm.multimodal.parse import (DictEmbeddingItems, ModalityDataItems,
                                    MultiModalDataItems, MultiModalDataParser)
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
@@ -47,6 +49,8 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import (IsAttentionFree, MultiModalEmbeddings,
                          SupportsMultiModal)
 from .interfaces_base import default_pooling_type
+
+logger = init_logger(__name__)
 
 
 def _terratorch_field_names(pretrained_cfg: dict):
@@ -97,9 +101,16 @@ class TerratorchInputBuilder(BaseDummyInputsBuilder[TerratorchProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: Optional[Mapping[str, BaseDummyOptions]] = None,
     ) -> MultiModalDataDict:
         # Dummy data is generated based on the 'input' section
         # defined in the HF configuration file
+
+        if mm_options:
+            logger.warning("Configurable multimodal profiling "
+                           "options are not supported for Terratorch. "
+                           "They are ignored for now.")
+
         return self.dummy_data_generator.get_dummy_mm_data()
 
 
@@ -164,7 +175,7 @@ class TerratorchMultiModalProcessor(BaseMultiModalProcessor):
         mm_data: MultiModalDataDict,
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Optional[Mapping[str, object]] = None,
-        mm_hash_overrides: Optional[dict[str, list[str]]] = None,
+        mm_uuids: Optional[MultiModalUUIDDict] = None,
     ) -> MultiModalInputs:
         if "image" in mm_data:
             image_data = mm_data["image"]
@@ -174,9 +185,10 @@ class TerratorchMultiModalProcessor(BaseMultiModalProcessor):
 
         mm_items = self._to_mm_items(mm_data)
         tokenization_kwargs = tokenization_kwargs or {}
-        mm_hashes = (mm_hash_overrides if mm_hash_overrides is not None else
-                     self._hash_mm_items(mm_items, hf_processor_mm_kwargs,
-                                         tokenization_kwargs))
+        mm_hashes = self._hash_mm_items(mm_items,
+                                        hf_processor_mm_kwargs,
+                                        tokenization_kwargs,
+                                        mm_uuids=mm_uuids)
         mm_placeholders = {"image": [PlaceholderRange(offset=0, length=0)]}
 
         mm_processed_data = BatchFeature(image_data)
@@ -189,7 +201,6 @@ class TerratorchMultiModalProcessor(BaseMultiModalProcessor):
 
         return MultiModalInputs(
             type="multimodal",
-            prompt=prompt,
             prompt_token_ids=[1],
             mm_kwargs=mm_kwargs,
             mm_hashes=mm_hashes,
@@ -232,6 +243,9 @@ class Terratorch(nn.Module, IsAttentionFree, SupportsMultiModal):
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        *,
+        is_multimodal: Optional[torch.Tensor] = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         # We do not really use any input tokens and therefore no embeddings
         # to be calculated. However, due to the mandatory token ids in

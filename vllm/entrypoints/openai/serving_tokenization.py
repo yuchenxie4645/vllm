@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.protocol import (DetokenizeRequest,
 # yapf: enable
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
+from vllm.entrypoints.renderer import RenderConfig
 from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
@@ -39,6 +40,7 @@ class OpenAIServingTokenization(OpenAIServing):
         request_logger: Optional[RequestLogger],
         chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
+        trust_request_chat_template: bool = False,
         log_error_stack: bool = False,
     ) -> None:
         super().__init__(engine_client=engine_client,
@@ -49,6 +51,7 @@ class OpenAIServingTokenization(OpenAIServing):
 
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
+        self.trust_request_chat_template = trust_request_chat_template
 
     async def create_tokenize(
         self,
@@ -64,15 +67,23 @@ class OpenAIServingTokenization(OpenAIServing):
         try:
             lora_request = self._maybe_get_adapters(request)
 
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+            tokenizer = await self.engine_client.get_tokenizer()
             renderer = self._get_renderer(tokenizer)
 
             if isinstance(request, TokenizeChatRequest):
                 tool_dicts = (None if request.tools is None else
                               [tool.model_dump() for tool in request.tools])
+                error_check_ret = self._validate_chat_template(
+                    request_chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    trust_request_chat_template=self.
+                    trust_request_chat_template,
+                )
+                if error_check_ret is not None:
+                    return error_check_ret
                 (
                     _,
-                    request_prompts,
+                    _,
                     engine_prompts,
                 ) = await self._preprocess_chat(
                     request,
@@ -90,15 +101,14 @@ class OpenAIServingTokenization(OpenAIServing):
             else:
                 engine_prompts = await renderer.render_prompt(
                     prompt_or_prompts=request.prompt,
-                    add_special_tokens=request.add_special_tokens,
-                    cache_salt=getattr(request, 'cache_salt', None),
+                    config=self._build_render_config(request),
                 )
         except (ValueError, TypeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
         input_ids: list[int] = []
-        for i, engine_prompt in enumerate(engine_prompts):
+        for engine_prompt in engine_prompts:
             self._log_inputs(request_id,
                              engine_prompt,
                              params=None,
@@ -130,7 +140,7 @@ class OpenAIServingTokenization(OpenAIServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        tokenizer = await self.engine_client.get_tokenizer(lora_request)
+        tokenizer = await self.engine_client.get_tokenizer()
 
         self._log_inputs(request_id,
                          request.tokens,
@@ -156,6 +166,9 @@ class OpenAIServingTokenization(OpenAIServing):
         except Exception as e:
             return self.create_error_response(
                 f"Failed to get tokenizer info: {str(e)}")
+
+    def _build_render_config(self, request: TokenizeRequest) -> RenderConfig:
+        return RenderConfig(add_special_tokens=request.add_special_tokens)
 
 
 @dataclass
